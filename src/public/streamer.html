@@ -1,0 +1,253 @@
+<!-- public/streamer.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Streamer</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f2f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .video-container {
+            margin: 20px 0;
+            background: #000;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        video {
+            width: 100%;
+            max-width: 640px;
+            background: #000;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .error {
+            background: #ffebee;
+            color: #c62828;
+        }
+        .success {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+        button {
+            background: #1a73e8;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        #roomInfo {
+            margin: 20px 0;
+            padding: 15px;
+            background: #e3f2fd;
+            border-radius: 4px;
+        }
+        #viewerCount {
+            font-weight: bold;
+            color: #1a73e8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Live Stream</h1>
+        <div id="status" class="status"></div>
+        <button id="startStream">Start Streaming</button>
+        <button id="stopStream" disabled>Stop Streaming</button>
+        <div class="video-container">
+            <video id="localVideo" autoplay muted playsinline></video>
+        </div>
+        <div id="roomInfo"></div>
+        <div id="viewerCount">Viewers: 0</div>
+    </div>
+
+    <script>
+        const config = {
+            iceServers: [
+                {
+                    urls: [
+                        'stun:stun1.l.google.com:19302',
+                        'stun:stun2.l.google.com:19302',
+                        'stun:stun3.l.google.com:19302',
+                        'stun:stun4.l.google.com:19302'
+                    ]
+                }
+            ],
+            iceCandidatePoolSize: 10,
+            iceTransportPolicy: 'all'
+        };
+
+        class Streamer {
+            constructor() {
+                this.socket = io({
+                    reconnectionDelayMax: 10000,
+                    reconnection: true,
+                    reconnectionAttempts: 10
+                });
+                this.peerConnections = new Map();
+                this.localStream = null;
+                this.roomId = null;
+                this.setupSocketListeners();
+            }
+
+            setupSocketListeners() {
+                this.socket.on('connect', () => {
+                    console.log('Connected to server');
+                });
+
+                this.socket.on('disconnect', () => {
+                    console.log('Disconnected from server');
+                    this.showStatus('Disconnected from server', 'error');
+                });
+
+                this.socket.on('room-created', this.handleRoomCreated.bind(this));
+                this.socket.on('viewer-joined', this.handleViewerJoined.bind(this));
+                this.socket.on('viewer-left', this.handleViewerLeft.bind(this));
+                this.socket.on('signal', this.handleSignal.bind(this));
+                this.socket.on('error', this.handleError.bind(this));
+            }
+
+            async startStream() {
+                try {
+                    this.localStream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            width: { ideal: 1280 },
+                            height: { ideal: 720 }
+                        },
+                        audio: true
+                    });
+                    
+                    document.getElementById('localVideo').srcObject = this.localStream;
+                    this.roomId = Math.random().toString(36).substr(2, 9);
+                    this.socket.emit('create-room', this.roomId);
+                    
+                    document.getElementById('startStream').disabled = true;
+                    document.getElementById('stopStream').disabled = false;
+                } catch (err) {
+                    this.showStatus(`Error accessing media devices: ${err.message}`, 'error');
+                }
+            }
+
+            stopStream() {
+                if (this.localStream) {
+                    this.localStream.getTracks().forEach(track => track.stop());
+                }
+                this.peerConnections.forEach(pc => pc.close());
+                this.peerConnections.clear();
+                this.socket.disconnect();
+                window.location.reload();
+            }
+
+            async handleViewerJoined({ viewerId, viewerCount }) {
+                try {
+                    const peerConnection = new RTCPeerConnection(config);
+                    this.peerConnections.set(viewerId, peerConnection);
+
+                    if (this.localStream) {
+                        this.localStream.getTracks().forEach(track => {
+                            peerConnection.addTrack(track, this.localStream);
+                        });
+                    }
+
+                    peerConnection.onicecandidate = (event) => {
+                        if (event.candidate) {
+                            this.socket.emit('signal', {
+                                target: viewerId,
+                                message: { type: 'candidate', candidate: event.candidate }
+                            });
+                        }
+                    };
+
+                    peerConnection.onconnectionstatechange = () => {
+                        console.log(`Connection state for ${viewerId}:`, peerConnection.connectionState);
+                    };
+
+                    const offer = await peerConnection.createOffer({
+                        offerToReceiveAudio: true,
+                        offerToReceiveVideo: true
+                    });
+                    await peerConnection.setLocalDescription(offer);
+                    
+                    this.socket.emit('signal', {
+                        target: viewerId,
+                        message: { type: 'offer', sdp: offer }
+                    });
+
+                    document.getElementById('viewerCount').textContent = `Viewers: ${viewerCount}`;
+                } catch (err) {
+                    this.showStatus(`Error connecting to viewer: ${err.message}`, 'error');
+                }
+            }
+
+            handleViewerLeft({ viewerId, viewerCount }) {
+                const pc = this.peerConnections.get(viewerId);
+                if (pc) {
+                    pc.close();
+                    this.peerConnections.delete(viewerId);
+                }
+                document.getElementById('viewerCount').textContent = `Viewers: ${viewerCount}`;
+            }
+
+            async handleSignal({ from, message }) {
+                try {
+                    const pc = this.peerConnections.get(from);
+                    if (!pc) return;
+
+                    if (message.type === 'answer') {
+                        await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+                    } else if (message.type === 'candidate') {
+                        await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+                    }
+                } catch (err) {
+                    this.showStatus(`Signaling error: ${err.message}`, 'error');
+                }
+            }
+
+            handleRoomCreated(roomId) {
+                const roomUrl = `${window.location.origin}/viewer.html?room=${roomId}`;
+                document.getElementById('roomInfo').innerHTML = `
+                    <p>Room ID: ${roomId}</p>
+                    <p>Share this link: <a href="${roomUrl}" target="_blank">${roomUrl}</a></p>
+                `;
+                this.showStatus('Stream started successfully', 'success');
+            }
+
+            handleError(message) {
+                this.showStatus(message, 'error');
+            }
+
+            showStatus(message, type) {
+                const status = document.getElementById('status');
+                status.textContent = message;
+                status.className = `status ${type}`;
+            }
+        }
+
+        const streamer = new Streamer();
+        document.getElementById('startStream').onclick = () => streamer.startStream();
+        document.getElementById('stopStream').onclick = () => streamer.stopStream();
+    </script>
+</body>
+</html>
